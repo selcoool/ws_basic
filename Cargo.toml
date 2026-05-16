@@ -1,22 +1,161 @@
+# 2. MỞ 3 TAB WEBSOCKET
+# USER 1
+# ws://127.0.0.1:8080/ws/1
+# USER 2
+# ws://127.0.0.1:8080/ws/2
+# USER 3
+# ws://127.0.0.1:8080/ws/3
+
+
+
+# 3. TẠO USER
+# POST
+# http://127.0.0.1:8080/users
+# BODY → raw → JSON
+# USER 1
+# {
+#   "username": "an123",
+#   "display_name": "An",
+#   "avatar": "an.jpg"
+# }
+
+
+
+# 4. CHAT CÁ NHÂN
+# POST
+# http://127.0.0.1:8080/private-message
+# BODY
+# {
+#   "sender_id": 1,
+#   "receiver_id": 2,
+#   "content": "hello Binh"
+# }
+
+
+# 8. CHAT PUBLIC
+# POST
+# http://127.0.0.1:8080/public-message
+# BODY
+# {
+#   "sender_id": 2,
+#   "content": "hello everyone"
+# }
+
+
+
+
+
+# 5. TẠO GROUP
+# POST
+# http://127.0.0.1:8080/groups
+# BODY
+# {
+#   "title": "RUST TEAM"
+# }
+
+
+# RESPONSE
+# {
+#   "success": true,
+#   "conversation_id": 2
+# }
+
+# 6. ADD MEMBER GROUP
+# POST
+# http://127.0.0.1:8080/members
+# USER 1
+# {
+#   "conversation_id": 2,
+#   "user_id": 1
+# }
+
+
+
+
+
+# 7. CHAT GROUP
+# POST
+# http://127.0.0.1:8080/group-message
+# BODY
+# {
+#   "sender_id": 1,
+#   "conversation_id": 2,
+#   "content": "hello group"
+# }
+
+
+
+
+
+
+# -- ================= USERS =================
+
+# CREATE TABLE users (
+
+#     id BIGINT AUTO_INCREMENT PRIMARY KEY,
+
+#     username VARCHAR(50)
+#     UNIQUE NOT NULL,
+
+#     display_name VARCHAR(100)
+#     NOT NULL,
+
+#     avatar TEXT NULL,
+
+#     created_at TIMESTAMP
+#     DEFAULT CURRENT_TIMESTAMP
+# );
+
+# -- ================= CONVERSATIONS =================
+
+# CREATE TABLE conversations (
+
+#     id BIGINT AUTO_INCREMENT PRIMARY KEY,
+
+#     type ENUM(
+#         'private',
+#         'group',
+#         'public'
+#     ) NOT NULL,
+
+#     title VARCHAR(255) NULL,
+
+#     created_at TIMESTAMP
+#     DEFAULT CURRENT_TIMESTAMP
+# );
+
+# -- ================= MEMBERS =================
+
+# CREATE TABLE conversation_members (
+
+#     id BIGINT AUTO_INCREMENT PRIMARY KEY,
+
+#     conversation_id BIGINT NOT NULL,
+
+#     user_id BIGINT NOT NULL
+# );
+
+# -- ================= MESSAGES =================
 
 # CREATE TABLE messages (
 
-#     id INT AUTO_INCREMENT PRIMARY KEY,
+#     id BIGINT AUTO_INCREMENT PRIMARY KEY,
 
-#     sender_id INT NOT NULL,
+#     conversation_id BIGINT NULL,
 
-#     receiver_id INT NULL,
+#     sender_id BIGINT NOT NULL,
 
-#     group_id INT NULL,
+#     message_type ENUM(
+#         'private',
+#         'group',
+#         'public'
+#     ) NOT NULL,
 
-#     message_type VARCHAR(50),
+#     content TEXT NOT NULL,
 
-#     content TEXT,
-
-#     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+#     created_at TIMESTAMP
+#     DEFAULT CURRENT_TIMESTAMP
 # );
-
-
 
 
 
@@ -43,6 +182,116 @@ sqlx = { version = "0.7", features = [
 futures-util = "0.3"
 
 dotenv = "0.15"
+
+
+
+
+
+
+# CREATE TABLE users (
+#     id INT AUTO_INCREMENT PRIMARY KEY,
+#     name VARCHAR(100) NOT NULL,
+#     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+# );
+
+# -- ================= GROUPS =================
+# CREATE TABLE groups (
+#     id INT AUTO_INCREMENT PRIMARY KEY,
+#     name VARCHAR(100) NOT NULL,
+#     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+# );
+
+# -- ================= GROUP MEMBERS =================
+# CREATE TABLE group_members (
+#     id INT AUTO_INCREMENT PRIMARY KEY,
+#     group_id INT NOT NULL,
+#     user_id INT NOT NULL,
+
+#     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+#     UNIQUE KEY unique_group_user (group_id, user_id),
+
+#     FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
+#     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+# );
+
+# -- ================= MESSAGES =================
+# CREATE TABLE messages (
+#     id INT AUTO_INCREMENT PRIMARY KEY,
+
+#     sender_id INT NOT NULL,
+#     receiver_id INT NULL,
+#     group_id INT NULL,
+
+#     message_type ENUM('public','private','group') NOT NULL,
+
+#     content TEXT NOT NULL,
+
+#     is_read BOOLEAN DEFAULT FALSE,
+
+#     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+#     FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE
+# );
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# CREATE TABLE messages (
+
+#     id INT AUTO_INCREMENT PRIMARY KEY,
+
+#     sender_id INT NOT NULL,
+
+#     receiver_id INT NULL,
+
+#     group_id INT NULL,
+
+#     message_type VARCHAR(50),
+
+#     content TEXT,
+
+#     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+# );
+
+
+
+
+
+# [package]
+# name = "chat_realtime"
+# version = "0.1.0"
+# edition = "2024"
+
+# [dependencies]
+# actix-web = "4"
+# actix-ws = "0.3"
+
+# tokio = { version = "1", features = ["full"] }
+
+# serde = { version = "1", features = ["derive"] }
+# serde_json = "1"
+
+# sqlx = { version = "0.7", features = [
+#     "runtime-tokio",
+#     "mysql",
+#     "macros"
+# ] }
+
+# futures-util = "0.3"
+
+# dotenv = "0.15"
 
 
 
@@ -150,18 +399,18 @@ dotenv = "0.15"
 
 
 
-# // CREATE TABLE messages (
+#  CREATE TABLE messages (
 
-# //     id BIGINT PRIMARY KEY AUTO_INCREMENT,
+#      id BIGINT PRIMARY KEY AUTO_INCREMENT,
 
-# //     sender_id INT NOT NULL,
+#      sender_id INT NOT NULL,
 
-# //     receiver_id INT NOT NULL,
+#      receiver_id INT NOT NULL,
 
-# //     content TEXT NOT NULL,
+#      content TEXT NOT NULL,
 
-# //     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-# // );
+#      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+#  );
 
 # [package]
 # name = "ws_basic"

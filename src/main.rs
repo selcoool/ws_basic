@@ -1,259 +1,1411 @@
 mod db;
 
 use actix_web::{
-    rt,
     web,
     App,
-    Error,
     HttpRequest,
     HttpResponse,
     HttpServer,
+    Responder,
 };
 
-use actix_ws;
+use actix_ws::Message;
 
 use futures_util::StreamExt;
 
 use serde::Deserialize;
 
-use sqlx::MySqlPool;
-
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Mutex,
+use sqlx::{
+    MySqlPool,
+    Row
 };
 
-use tokio::sync::mpsc;
+use std::{
+    collections::HashMap,
+    sync::Arc
+};
 
+use tokio::sync::{
+    Mutex,
+    mpsc::UnboundedSender
+};
 
+use db::connect_db;
 
-
-
-// ================= STATE =================
+#[derive(Clone)]
 
 struct AppState {
-    users: Mutex<HashMap<i32, mpsc::UnboundedSender<String>>>,
-    groups: Mutex<HashMap<i32, HashSet<i32>>>,
+
+    clients: Arc<
+        Mutex<
+            HashMap<
+                i64,
+                UnboundedSender<String>
+            >
+        >
+    >
 }
-
-
-
-
-
-// ================= REQUEST =================
 
 #[derive(Deserialize)]
-struct CreateMessage {
-    sender_id: i32,
-    receiver_id: Option<i32>,
-    group_id: Option<i32>,
-    message_type: String,
-    content: String,
+
+struct CreateUserRequest {
+
+    username: String,
+
+    display_name: String,
+
+    avatar: Option<String>
 }
 
+#[derive(Deserialize)]
 
+struct CreateGroupRequest {
 
+    title: String
+}
 
+#[derive(Deserialize)]
 
-// ================= WS =================
+struct AddMemberRequest {
+
+    conversation_id: i64,
+
+    user_id: i64
+}
+
+#[derive(Deserialize)]
+
+struct PrivateMessageRequest {
+
+    sender_id: i64,
+
+    receiver_id: i64,
+
+    content: String
+}
+
+#[derive(Deserialize)]
+
+struct GroupMessageRequest {
+
+    sender_id: i64,
+
+    conversation_id: i64,
+
+    content: String
+}
+
+#[derive(Deserialize)]
+
+struct PublicMessageRequest {
+
+    sender_id: i64,
+
+    content: String
+}
 
 async fn ws_handler(
+
     req: HttpRequest,
+
     stream: web::Payload,
-    path: web::Path<i32>,
-    data: web::Data<AppState>,
-) -> Result<HttpResponse, Error> {
 
-    let user_id = path.into_inner();
+    path: web::Path<i64>,
 
-    let (res, mut session, mut msg_stream) =
-        actix_ws::handle(&req, stream)?;
+    state: web::Data<AppState>
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+) -> HttpResponse {
 
-    data.users.lock().unwrap().insert(user_id, tx);
+    let user_id =
+        path.into_inner();
 
-    let state = data.clone();
+    let (
+        response,
+        mut session,
+        mut msg_stream
+    ) =
+        actix_ws::handle(
+            &req,
+            stream
+        )
+        .unwrap();
 
+    println!(
+        "USER CONNECTED => {}",
+        user_id
+    );
 
+    let (
+        tx,
+        mut rx
+    ) =
+        tokio::sync::mpsc
+            ::unbounded_channel::<String>();
 
+    state
+        .clients
+        .lock()
+        .await
+        .insert(user_id, tx);
 
+    let state_clone =
+        state.clone();
 
-    rt::spawn(async move {
+    actix_web::rt::spawn(async move {
 
         loop {
+
             tokio::select! {
 
-                Some(msg) = rx.recv() => {
-                    let _ = session.text(msg).await;
+                Some(server_msg) =
+                    rx.recv() => {
+
+                    let _ =
+                        session
+                            .text(server_msg)
+                            .await;
                 }
 
-                Some(Ok(msg)) = msg_stream.next() => {
-                    if let actix_ws::Message::Close(_) = msg {
-                        break;
+                Some(msg) =
+                    msg_stream.next() => {
+
+                    match msg {
+
+                        Ok(Message::Close(_)) => {
+
+                            println!(
+                                "USER DISCONNECTED => {}",
+                                user_id
+                            );
+
+                            state_clone
+                                .clients
+                                .lock()
+                                .await
+                                .remove(&user_id);
+
+                            break;
+                        }
+
+                        _ => {}
                     }
                 }
 
                 else => break
             }
         }
-
-        state.users.lock().unwrap().remove(&user_id);
     });
 
-    Ok(res)
+    response
 }
 
+async fn create_user(
 
-
-
-
-// ================= CREATE MESSAGE =================
-
-async fn create_message(
-    data: web::Data<AppState>,
     pool: web::Data<MySqlPool>,
-    body: web::Json<CreateMessage>,
-) -> HttpResponse {
 
-    let result = sqlx::query(
-        r#"
-        INSERT INTO messages
-        (sender_id, receiver_id, group_id, message_type, content)
-        VALUES (?, ?, ?, ?, ?)
-        "#
+    body: web::Json<CreateUserRequest>
+
+) -> impl Responder {
+
+    let result =
+        sqlx::query(
+            "
+            INSERT INTO users
+            (
+                username,
+                display_name,
+                avatar
+            )
+            VALUES (?, ?, ?)
+            "
+        )
+
+        .bind(&body.username)
+
+        .bind(&body.display_name)
+
+        .bind(&body.avatar)
+
+        .execute(pool.get_ref())
+
+        .await
+
+        .unwrap();
+
+    HttpResponse::Ok().json(
+        serde_json::json!({
+
+            "success": true,
+
+            "user_id":
+                result.last_insert_id()
+        })
     )
-    .bind(body.sender_id)
-    .bind(body.receiver_id)
-    .bind(body.group_id)
-    .bind(&body.message_type)
-    .bind(&body.content)
+}
+
+async fn create_group(
+
+    pool: web::Data<MySqlPool>,
+
+    body: web::Json<CreateGroupRequest>
+
+) -> impl Responder {
+
+    let result =
+        sqlx::query(
+            "
+            INSERT INTO conversations
+            (
+                type,
+                title
+            )
+            VALUES
+            (
+                'group',
+                ?
+            )
+            "
+        )
+
+        .bind(&body.title)
+
+        .execute(pool.get_ref())
+
+        .await
+
+        .unwrap();
+
+    HttpResponse::Ok().json(
+        serde_json::json!({
+
+            "success": true,
+
+            "conversation_id":
+                result.last_insert_id()
+        })
+    )
+}
+
+async fn add_member(
+
+    pool: web::Data<MySqlPool>,
+
+    body: web::Json<AddMemberRequest>
+
+) -> impl Responder {
+
+    sqlx::query(
+        "
+        INSERT INTO conversation_members
+        (
+            conversation_id,
+            user_id
+        )
+        VALUES (?, ?)
+        "
+    )
+
+    .bind(body.conversation_id)
+
+    .bind(body.user_id)
+
     .execute(pool.get_ref())
+
     .await
+
     .unwrap();
 
-    let id = result.last_insert_id() as i32;
+    HttpResponse::Ok().json(
+        serde_json::json!({
 
-    let payload = serde_json::json!({
-        "event": "message_created",
-        "id": id,
-        "sender_id": body.sender_id,
-        "receiver_id": body.receiver_id,
-        "group_id": body.group_id,
-        "message_type": body.message_type,
-        "content": body.content
-    });
+            "success": true
+        })
+    )
+}
 
-    let msg = payload.to_string();
+async fn private_message(
 
-    let users = data.users.lock().unwrap();
+    pool: web::Data<MySqlPool>,
 
+    state: web::Data<AppState>,
 
+    body: web::Json<PrivateMessageRequest>
 
+) -> impl Responder {
 
+    let existing =
+        sqlx::query(
+            "
+            SELECT c.id
+            FROM conversations c
 
-    // ================= PUBLIC =================
-    if body.message_type == "public" {
-        for (_, tx) in users.iter() {
-            let _ = tx.send(msg.clone());
-        }
+            JOIN conversation_members m1
+            ON c.id = m1.conversation_id
+
+            JOIN conversation_members m2
+            ON c.id = m2.conversation_id
+
+            WHERE c.type = 'private'
+
+            AND m1.user_id = ?
+
+            AND m2.user_id = ?
+
+            LIMIT 1
+            "
+        )
+
+        .bind(body.sender_id)
+
+        .bind(body.receiver_id)
+
+        .fetch_optional(pool.get_ref())
+
+        .await
+
+        .unwrap();
+
+    let conversation_id: i64;
+
+    if let Some(row) = existing {
+
+        conversation_id =
+            row.get("id");
+
+    } else {
+
+        let create =
+            sqlx::query(
+                "
+                INSERT INTO conversations(type)
+                VALUES('private')
+                "
+            )
+
+            .execute(pool.get_ref())
+
+            .await
+
+            .unwrap();
+
+        conversation_id =
+            create.last_insert_id()
+                as i64;
+
+        sqlx::query(
+            "
+            INSERT INTO conversation_members
+            (
+                conversation_id,
+                user_id
+            )
+            VALUES (?, ?)
+            "
+        )
+
+        .bind(conversation_id)
+
+        .bind(body.sender_id)
+
+        .execute(pool.get_ref())
+
+        .await
+
+        .unwrap();
+
+        sqlx::query(
+            "
+            INSERT INTO conversation_members
+            (
+                conversation_id,
+                user_id
+            )
+            VALUES (?, ?)
+            "
+        )
+
+        .bind(conversation_id)
+
+        .bind(body.receiver_id)
+
+        .execute(pool.get_ref())
+
+        .await
+
+        .unwrap();
     }
 
+    let user =
+        sqlx::query(
+            "
+            SELECT *
+            FROM users
+            WHERE id = ?
+            "
+        )
 
+        .bind(body.sender_id)
 
+        .fetch_one(pool.get_ref())
 
+        .await
 
-    // ================= PRIVATE =================
-    else if body.message_type == "private" {
-        if let Some(rid) = body.receiver_id {
+        .unwrap();
 
-            if let Some(tx) = users.get(&rid) {
-                let _ = tx.send(msg.clone());
+    let insert =
+        sqlx::query(
+            "
+            INSERT INTO messages
+            (
+                conversation_id,
+                sender_id,
+                message_type,
+                content
+            )
+            VALUES (?, ?, 'private', ?)
+            "
+        )
+
+        .bind(conversation_id)
+
+        .bind(body.sender_id)
+
+        .bind(&body.content)
+
+        .execute(pool.get_ref())
+
+        .await
+
+        .unwrap();
+
+    let payload =
+        serde_json::json!({
+
+            "event":
+                "private_message",
+
+            "message": {
+
+                "id":
+                    insert.last_insert_id(),
+
+                "conversation_id":
+                    conversation_id,
+
+                "sender": {
+
+                    "id":
+                        user.get::<i64, _>("id"),
+
+                    "display_name":
+                        user.get::<String, _>(
+                            "display_name"
+                        )
+                },
+
+                "receiver_id":
+                    body.receiver_id,
+
+                "content":
+                    body.content
             }
+        });
 
-            if let Some(tx) = users.get(&body.sender_id) {
-                let _ = tx.send(msg.clone());
-            }
-        }
+    let text =
+        payload.to_string();
+
+    let clients =
+        state.clients
+            .lock()
+            .await;
+
+    // ================= RECEIVER =================
+
+    if let Some(tx) =
+        clients.get(&body.receiver_id)
+    {
+        let _ =
+            tx.send(
+                text.clone()
+            );
     }
 
+    // ================= SENDER =================
 
+    if let Some(tx) =
+        clients.get(&body.sender_id)
+    {
+        let _ =
+            tx.send(
+                text.clone()
+            );
+    }
 
+    HttpResponse::Ok().json(payload)
+}
 
+async fn group_message(
 
-    // ================= GROUP =================
-    else if body.message_type == "group" {
-        if let Some(gid) = body.group_id {
+    pool: web::Data<MySqlPool>,
 
-            if let Some(members) =
-                data.groups.lock().unwrap().get(&gid)
-            {
-                for uid in members {
-                    if let Some(tx) = users.get(uid) {
-                        let _ = tx.send(msg.clone());
-                    }
-                }
+    state: web::Data<AppState>,
+
+    body: web::Json<GroupMessageRequest>
+
+) -> impl Responder {
+
+    let user =
+        sqlx::query(
+            "
+            SELECT *
+            FROM users
+            WHERE id = ?
+            "
+        )
+
+        .bind(body.sender_id)
+
+        .fetch_one(pool.get_ref())
+
+        .await
+
+        .unwrap();
+
+    let insert =
+        sqlx::query(
+            "
+            INSERT INTO messages
+            (
+                conversation_id,
+                sender_id,
+                message_type,
+                content
+            )
+            VALUES (?, ?, 'group', ?)
+            "
+        )
+
+        .bind(body.conversation_id)
+
+        .bind(body.sender_id)
+
+        .bind(&body.content)
+
+        .execute(pool.get_ref())
+
+        .await
+
+        .unwrap();
+
+    let payload =
+        serde_json::json!({
+
+            "event":
+                "group_message",
+
+            "message": {
+
+                "id":
+                    insert.last_insert_id(),
+
+                "conversation_id":
+                    body.conversation_id,
+
+                "sender": {
+
+                    "id":
+                        user.get::<i64, _>("id"),
+
+                    "display_name":
+                        user.get::<String, _>(
+                            "display_name"
+                        )
+                },
+
+                "content":
+                    body.content
             }
+        });
+
+    let members =
+        sqlx::query(
+            "
+            SELECT user_id
+            FROM conversation_members
+            WHERE conversation_id = ?
+            "
+        )
+
+        .bind(body.conversation_id)
+
+        .fetch_all(pool.get_ref())
+
+        .await
+
+        .unwrap();
+
+    let clients =
+        state.clients
+            .lock()
+            .await;
+
+    for row in members {
+
+        let uid: i64 =
+            row.get("user_id");
+
+        if let Some(tx) =
+            clients.get(&uid)
+        {
+            let _ =
+                tx.send(
+                    payload.to_string()
+                );
         }
     }
 
     HttpResponse::Ok().json(payload)
 }
 
+async fn public_message(
 
+    pool: web::Data<MySqlPool>,
 
+    state: web::Data<AppState>,
 
+    body: web::Json<PublicMessageRequest>
 
-// ================= GROUP ADD =================
+) -> impl Responder {
 
-async fn add_group_member(
-    data: web::Data<AppState>,
-    path: web::Path<(i32, i32)>,
-) -> HttpResponse {
+    let user =
+        sqlx::query(
+            "
+            SELECT *
+            FROM users
+            WHERE id = ?
+            "
+        )
 
-    let (group_id, user_id) = path.into_inner();
+        .bind(body.sender_id)
 
-    data.groups
-        .lock()
-        .unwrap()
-        .entry(group_id)
-        .or_insert(HashSet::new())
-        .insert(user_id);
+        .fetch_one(pool.get_ref())
 
-    HttpResponse::Ok().json("added")
+        .await
+
+        .unwrap();
+
+    let insert =
+        sqlx::query(
+            "
+            INSERT INTO messages
+            (
+                sender_id,
+                message_type,
+                content
+            )
+            VALUES (?, 'public', ?)
+            "
+        )
+
+        .bind(body.sender_id)
+
+        .bind(&body.content)
+
+        .execute(pool.get_ref())
+
+        .await
+
+        .unwrap();
+
+    let payload =
+        serde_json::json!({
+
+            "event":
+                "public_message",
+
+            "message": {
+
+                "id":
+                    insert.last_insert_id(),
+
+                "sender": {
+
+                    "id":
+                        user.get::<i64, _>("id"),
+
+                    "display_name":
+                        user.get::<String, _>(
+                            "display_name"
+                        )
+                },
+
+                "content":
+                    body.content
+            }
+        });
+
+    let clients =
+        state.clients
+            .lock()
+            .await;
+
+    for (_, tx) in clients.iter() {
+
+        let _ =
+            tx.send(
+                payload.to_string()
+            );
+    }
+
+    HttpResponse::Ok().json(payload)
 }
-
-
-
-
-
-// ================= MAIN =================
 
 #[actix_web::main]
+
 async fn main() -> std::io::Result<()> {
 
-    let pool = db::connect_db().await;
+    let pool =
+        connect_db().await;
 
-    let state = web::Data::new(AppState {
-        users: Mutex::new(HashMap::new()),
-        groups: Mutex::new(HashMap::new()),
-    });
+    let state =
+        AppState {
 
-    println!("SERVER RUNNING => 8080");
+            clients:
+                Arc::new(
+                    Mutex::new(
+                        HashMap::new()
+                    )
+                )
+        };
+
+    println!(
+        "SERVER RUNNING => 8080"
+    );
 
     HttpServer::new(move || {
-        App::new()
-            .app_data(web::Data::new(pool.clone()))
-            .app_data(state.clone())
 
-            .route("/ws/{id}", web::get().to(ws_handler))
-            .route("/messages", web::post().to(create_message))
-            .route("/groups/{group_id}/{user_id}", web::post().to(add_group_member))
+        App::new()
+
+            .app_data(
+                web::Data::new(
+                    pool.clone()
+                )
+            )
+
+            .app_data(
+                web::Data::new(
+                    state.clone()
+                )
+            )
+
+            .route(
+                "/ws/{user_id}",
+                web::get().to(
+                    ws_handler
+                )
+            )
+
+            .route(
+                "/users",
+                web::post().to(
+                    create_user
+                )
+            )
+
+            .route(
+                "/groups",
+                web::post().to(
+                    create_group
+                )
+            )
+
+            .route(
+                "/members",
+                web::post().to(
+                    add_member
+                )
+            )
+
+            .route(
+                "/private-message",
+                web::post().to(
+                    private_message
+                )
+            )
+
+            .route(
+                "/group-message",
+                web::post().to(
+                    group_message
+                )
+            )
+
+            .route(
+                "/public-message",
+                web::post().to(
+                    public_message
+                )
+            )
     })
+
     .bind(("127.0.0.1", 8080))?
+
     .run()
+
     .await
 }
+
+
+
+
+
+// mod db;
+
+// use actix_web::{
+//     rt,
+//     web,
+//     App,
+//     Error,
+//     HttpRequest,
+//     HttpResponse,
+//     HttpServer,
+// };
+
+// use actix_ws;
+
+// use futures_util::StreamExt;
+
+// use serde::Deserialize;
+
+// use sqlx::MySqlPool;
+
+// use std::{
+//     collections::{HashMap, HashSet},
+//     sync::Mutex,
+// };
+
+// use tokio::sync::mpsc;
+
+
+
+
+
+// // ================= STATE =================
+
+// struct AppState {
+//     users: Mutex<HashMap<i32, mpsc::UnboundedSender<String>>>,
+//     groups: Mutex<HashMap<i32, HashSet<i32>>>,
+// }
+
+
+
+
+
+// // ================= REQUEST =================
+
+// #[derive(Deserialize)]
+// struct CreateMessage {
+//     sender_id: i32,
+//     sender_name: String,
+//     receiver_id: Option<i32>,
+//     group_id: Option<i32>,
+//     message_type: String,
+//     content: String,
+// }
+
+
+
+
+
+// // ================= WS HANDLER =================
+
+// async fn ws_handler(
+//     req: HttpRequest,
+//     stream: web::Payload,
+//     path: web::Path<i32>,
+//     data: web::Data<AppState>,
+// ) -> Result<HttpResponse, Error> {
+
+//     let user_id = path.into_inner();
+
+//     let (res, mut session, mut msg_stream) =
+//         actix_ws::handle(&req, stream)?;
+
+//     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+
+//     data.users.lock().unwrap().insert(user_id, tx);
+
+//     let state = data.clone();
+
+
+
+
+
+//     rt::spawn(async move {
+//         loop {
+//             tokio::select! {
+
+//                 Some(msg) = rx.recv() => {
+//                     let _ = session.text(msg).await;
+//                 }
+
+//                 Some(Ok(msg)) = msg_stream.next() => {
+//                     if let actix_ws::Message::Close(_) = msg {
+//                         break;
+//                     }
+//                 }
+
+//                 else => break
+//             }
+//         }
+
+//         state.users.lock().unwrap().remove(&user_id);
+//     });
+
+//     Ok(res)
+// }
+
+
+
+
+
+// // ================= CREATE MESSAGE =================
+
+// async fn create_message(
+//     data: web::Data<AppState>,
+//     pool: web::Data<MySqlPool>,
+//     body: web::Json<CreateMessage>,
+// ) -> HttpResponse {
+
+//     let result = sqlx::query(
+//         r#"
+//         INSERT INTO messages
+//         (sender_id, receiver_id, group_id, message_type, content)
+//         VALUES (?, ?, ?, ?, ?)
+//         "#
+//     )
+//     .bind(body.sender_id)
+//     .bind(body.receiver_id)
+//     .bind(body.group_id)
+//     .bind(&body.message_type)
+//     .bind(&body.content)
+//     .execute(pool.get_ref())
+//     .await;
+
+//     if result.is_err() {
+//         return HttpResponse::InternalServerError().body("DB error");
+//     }
+
+//     let id = result.unwrap().last_insert_id() as i32;
+
+
+
+
+
+//     let payload = serde_json::json!({
+//         "id": id,
+//         "sender_id": body.sender_id,
+//         "sender_name": body.sender_name,
+//         "receiver_id": body.receiver_id,
+//         "group_id": body.group_id,
+//         "message_type": body.message_type,
+//         "content": body.content
+//     });
+
+//     let msg = payload.to_string();
+
+
+
+
+
+//     let users = data.users.lock().unwrap();
+
+
+
+
+
+//     // ================= PUBLIC =================
+//     if body.message_type == "public" {
+//         for (_, tx) in users.iter() {
+//             let _ = tx.send(msg.clone());
+//         }
+//     }
+
+
+
+
+
+//     // ================= PRIVATE =================
+//     else if body.message_type == "private" {
+//         if let Some(rid) = body.receiver_id {
+//             if let Some(tx) = users.get(&rid) {
+//                 let _ = tx.send(msg.clone());
+//             }
+//             if let Some(tx) = users.get(&body.sender_id) {
+//                 let _ = tx.send(msg.clone());
+//             }
+//         }
+//     }
+
+
+
+
+
+//     // ================= GROUP (FIXED 100%) =================
+//     else if body.message_type == "group" {
+
+//         if let Some(gid) = body.group_id {
+
+//             let groups = data.groups.lock().unwrap();
+
+//             // group không tồn tại
+//             if !groups.contains_key(&gid) {
+//                 return HttpResponse::BadRequest().body("Group not found");
+//             }
+
+//             let members = groups.get(&gid).unwrap();
+
+//             // sender phải là member
+//             if !members.contains(&body.sender_id) {
+//                 return HttpResponse::Forbidden().body("Not group member");
+//             }
+
+//             // broadcast only members
+//             for uid in members {
+//                 if let Some(tx) = users.get(uid) {
+//                     let _ = tx.send(msg.clone());
+//                 }
+//             }
+//         }
+//     }
+
+//     HttpResponse::Ok().json(payload)
+// }
+
+
+
+
+
+// // ================= ADD GROUP MEMBER =================
+
+// async fn add_group_member(
+//     data: web::Data<AppState>,
+//     path: web::Path<(i32, i32)>,
+// ) -> HttpResponse {
+
+//     let (group_id, user_id) = path.into_inner();
+
+//     let mut groups = data.groups.lock().unwrap();
+
+//     groups
+//         .entry(group_id)
+//         .or_insert_with(HashSet::new)
+//         .insert(user_id);
+
+//     HttpResponse::Ok().json("added")
+// }
+
+
+
+
+
+// // ================= MAIN =================
+
+// #[actix_web::main]
+// async fn main() -> std::io::Result<()> {
+
+//     let pool = db::connect_db().await;
+
+//     let state = web::Data::new(AppState {
+//         users: Mutex::new(HashMap::new()),
+//         groups: Mutex::new(HashMap::new()), // ✅ FIXED
+//     });
+
+//     println!("SERVER RUNNING => 8080");
+
+//     HttpServer::new(move || {
+//         App::new()
+//             .app_data(web::Data::new(pool.clone()))
+//             .app_data(state.clone())
+
+//             .route("/ws/{id}", web::get().to(ws_handler))
+//             .route("/messages", web::post().to(create_message))
+//             .route("/groups/{group_id}/{user_id}", web::post().to(add_group_member))
+//     })
+//     .bind(("127.0.0.1", 8080))?
+//     .run()
+//     .await
+// }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// mod db;
+
+// use actix_web::{
+//     rt,
+//     web,
+//     App,
+//     Error,
+//     HttpRequest,
+//     HttpResponse,
+//     HttpServer,
+// };
+
+// use actix_ws;
+
+// use futures_util::StreamExt;
+
+// use serde::Deserialize;
+
+// use sqlx::MySqlPool;
+
+// use std::{
+//     collections::{HashMap, HashSet},
+//     sync::Mutex,
+// };
+
+// use tokio::sync::mpsc;
+
+
+
+
+
+// // ================= STATE =================
+
+// struct AppState {
+//     users: Mutex<HashMap<i32, mpsc::UnboundedSender<String>>>,
+//     groups: Mutex<HashMap<i32, HashSet<i32>>>,
+// }
+
+
+
+
+
+// // ================= REQUEST =================
+
+// #[derive(Deserialize)]
+// struct CreateMessage {
+//     sender_id: i32,
+//     receiver_id: Option<i32>,
+//     group_id: Option<i32>,
+//     message_type: String,
+//     content: String,
+// }
+
+
+
+
+
+// // ================= WS =================
+
+// async fn ws_handler(
+//     req: HttpRequest,
+//     stream: web::Payload,
+//     path: web::Path<i32>,
+//     data: web::Data<AppState>,
+// ) -> Result<HttpResponse, Error> {
+
+//     let user_id = path.into_inner();
+
+//     let (res, mut session, mut msg_stream) =
+//         actix_ws::handle(&req, stream)?;
+
+//     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+
+//     data.users.lock().unwrap().insert(user_id, tx);
+
+//     let state = data.clone();
+
+
+
+
+
+//     rt::spawn(async move {
+
+//         loop {
+//             tokio::select! {
+
+//                 Some(msg) = rx.recv() => {
+//                     let _ = session.text(msg).await;
+//                 }
+
+//                 Some(Ok(msg)) = msg_stream.next() => {
+//                     if let actix_ws::Message::Close(_) = msg {
+//                         break;
+//                     }
+//                 }
+
+//                 else => break
+//             }
+//         }
+
+//         state.users.lock().unwrap().remove(&user_id);
+//     });
+
+//     Ok(res)
+// }
+
+
+
+
+
+// // ================= CREATE MESSAGE =================
+
+// async fn create_message(
+//     data: web::Data<AppState>,
+//     pool: web::Data<MySqlPool>,
+//     body: web::Json<CreateMessage>,
+// ) -> HttpResponse {
+
+//     let result = sqlx::query(
+//         r#"
+//         INSERT INTO messages
+//         (sender_id, receiver_id, group_id, message_type, content)
+//         VALUES (?, ?, ?, ?, ?)
+//         "#
+//     )
+//     .bind(body.sender_id)
+//     .bind(body.receiver_id)
+//     .bind(body.group_id)
+//     .bind(&body.message_type)
+//     .bind(&body.content)
+//     .execute(pool.get_ref())
+//     .await
+//     .unwrap();
+
+//     let id = result.last_insert_id() as i32;
+
+//     let payload = serde_json::json!({
+//         "event": "message_created",
+//         "id": id,
+//         "sender_id": body.sender_id,
+//         "receiver_id": body.receiver_id,
+//         "group_id": body.group_id,
+//         "message_type": body.message_type,
+//         "content": body.content
+//     });
+
+//     let msg = payload.to_string();
+
+//     let users = data.users.lock().unwrap();
+
+
+
+
+
+//     // ================= PUBLIC =================
+//     if body.message_type == "public" {
+//         for (_, tx) in users.iter() {
+//             let _ = tx.send(msg.clone());
+//         }
+//     }
+
+
+
+
+
+//     // ================= PRIVATE =================
+//     else if body.message_type == "private" {
+//         if let Some(rid) = body.receiver_id {
+
+//             if let Some(tx) = users.get(&rid) {
+//                 let _ = tx.send(msg.clone());
+//             }
+
+//             if let Some(tx) = users.get(&body.sender_id) {
+//                 let _ = tx.send(msg.clone());
+//             }
+//         }
+//     }
+
+
+
+
+
+//     // ================= GROUP =================
+//     else if body.message_type == "group" {
+//         if let Some(gid) = body.group_id {
+
+//             if let Some(members) =
+//                 data.groups.lock().unwrap().get(&gid)
+//             {
+//                 for uid in members {
+//                     if let Some(tx) = users.get(uid) {
+//                         let _ = tx.send(msg.clone());
+//                     }
+//                 }
+//             }
+//         }
+//     }
+
+//     HttpResponse::Ok().json(payload)
+// }
+
+
+
+
+
+// // ================= GROUP ADD =================
+
+// async fn add_group_member(
+//     data: web::Data<AppState>,
+//     path: web::Path<(i32, i32)>,
+// ) -> HttpResponse {
+
+//     let (group_id, user_id) = path.into_inner();
+
+//     data.groups
+//         .lock()
+//         .unwrap()
+//         .entry(group_id)
+//         .or_insert(HashSet::new())
+//         .insert(user_id);
+
+//     HttpResponse::Ok().json("added")
+// }
+
+
+
+
+
+// // ================= MAIN =================
+
+// #[actix_web::main]
+// async fn main() -> std::io::Result<()> {
+
+//     let pool = db::connect_db().await;
+
+//     let state = web::Data::new(AppState {
+//         users: Mutex::new(HashMap::new()),
+//         groups: Mutex::new(HashMap::new()),
+//     });
+
+//     println!("SERVER RUNNING => 8080");
+
+//     HttpServer::new(move || {
+//         App::new()
+//             .app_data(web::Data::new(pool.clone()))
+//             .app_data(state.clone())
+
+//             .route("/ws/{id}", web::get().to(ws_handler))
+//             .route("/messages", web::post().to(create_message))
+//             .route("/groups/{group_id}/{user_id}", web::post().to(add_group_member))
+//     })
+//     .bind(("127.0.0.1", 8080))?
+//     .run()
+//     .await
+// }
 
 
 
